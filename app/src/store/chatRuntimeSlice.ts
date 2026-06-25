@@ -2,6 +2,7 @@ import { createAsyncThunk, createSlice, type PayloadAction } from '@reduxjs/tool
 import debug from 'debug';
 
 import { threadApi } from '../services/api/threadApi';
+import type { ThreadMessage } from '../types/thread';
 import type {
   AgentRun,
   PersistedSubagentActivity,
@@ -14,7 +15,12 @@ import { resetUserScopedState } from './resetActions';
 
 const turnStateLog = debug('chatRuntime.turnState');
 
-export type ToolTimelineEntryStatus = 'running' | 'success' | 'error' | 'awaiting_user';
+export type ToolTimelineEntryStatus =
+  | 'running'
+  | 'success'
+  | 'error'
+  | 'awaiting_user'
+  | 'cancelled';
 
 export interface InferenceStatus {
   phase: 'thinking' | 'tool_use' | 'subagent';
@@ -128,6 +134,10 @@ export type SubagentTranscriptItem =
       status: ToolTimelineEntryStatus;
       elapsedMs?: number;
       outputChars?: number;
+      /** Arguments the child invoked the tool with (set on start). */
+      args?: unknown;
+      /** The tool's actual output text (set on completion). */
+      result?: string;
     };
 
 /** One child tool call performed by a running sub-agent. */
@@ -143,6 +153,10 @@ export interface SubagentToolCallEntry {
   elapsedMs?: number;
   /** Character length of the tool result (set on completion). */
   outputChars?: number;
+  /** Arguments the child invoked the tool with (set on start). */
+  args?: unknown;
+  /** The tool's actual output text (set on completion). */
+  result?: string;
 }
 
 export interface ToolTimelineEntry {
@@ -207,6 +221,13 @@ export interface PendingApproval {
    * extracted from the event's redacted args for display. Empty if unavailable.
    */
   command?: string;
+  /**
+   * Toolkit slug carried on `composio_connect` requests (#3993). Present only
+   * when `toolName === 'composio_connect'`; the inline connect card uses it to
+   * run the OAuth handoff and poll for completion. The slug is a public
+   * identifier (not PII), so it survives arg redaction unchanged.
+   */
+  toolkit?: string;
 }
 
 /**
@@ -289,6 +310,15 @@ interface ChatRuntimeState {
   artifactsByThread: Record<string, ArtifactSnapshot[]>;
   sessionTokenUsage: SessionTokenUsage;
   queueStatusByThread: Record<string, QueueStatus>;
+  /**
+   * Follow-up messages the user submitted while a turn was still streaming
+   * (queued via `queueMode: 'followup'`). The backend dispatches them as fresh
+   * turns once the current turn finishes; these entries are purely the
+   * optimistic UI surface so the user can see what they queued and clear it.
+   * Cleared per-thread on turn end (the queued texts then arrive as real
+   * messages on their dispatched turns).
+   */
+  queuedFollowupsByThread: Record<string, QueuedFollowup[]>;
 }
 
 /** Snapshot of the active-run queue depth per lane. */
@@ -298,6 +328,22 @@ export interface QueueStatus {
   followups: number;
   collects: number;
   total: number;
+}
+
+/** A follow-up message queued from the composer while a turn was streaming. */
+export interface QueuedFollowup {
+  /**
+   * The full user message, built exactly like a normal send (content +
+   * attachment metadata). It is persisted verbatim when the turn ends so the
+   * follow-up lands in the transcript identically to an interactive send.
+   * `message.id` doubles as the React key / removal handle.
+   */
+  message: ThreadMessage;
+  /**
+   * Display label for the pill — the message text, or the attachment file
+   * names for an attachments-only follow-up, so the row is never blank.
+   */
+  label: string;
 }
 
 const initialState: ChatRuntimeState = {
@@ -319,6 +365,7 @@ const initialState: ChatRuntimeState = {
     lastTurnOutputTokens: 0,
   },
   queueStatusByThread: {},
+  queuedFollowupsByThread: {},
 };
 
 /**
@@ -396,14 +443,55 @@ function toolTimelineFromPersisted(entry: PersistedToolTimelineEntry): ToolTimel
   };
 }
 
+/**
+ * Settle a rehydrated tool/subagent row that has no live event driver.
+ *
+ * A turn-state snapshot is a point-in-time mirror: a row left at the
+ * non-terminal `running` status was still in-flight when the snapshot was
+ * written. When the owning turn was *interrupted* (the core process that was
+ * driving it is gone — see `mark_all_interrupted`), no `subagent_done` /
+ * `chat_done` event will ever arrive to flip it terminal, so the row would
+ * pulse forever — the agent-name blink is driven by the row `status`
+ * (`agentNameTone(entry.status)`; `running` pulses, `cancelled` is muted &
+ * static). Settle the row to `cancelled` — terminal, muted, not pulsing —
+ * mirroring `markSubagentCancelled`.
+ *
+ * `running` is the only non-terminal value the persisted *row* status can carry
+ * (`PersistedToolStatus` is `running | success | error`), so that single guard
+ * catches every orphan.
+ *
+ * The nested `subagent.status` is a richer enum: a subagent that emitted
+ * `SubagentAwaitingUser` is persisted with the row `running` but
+ * `subagent.status = 'awaiting_user'`. Only settle a child that is *itself*
+ * still `running`; leaving `awaiting_user` (and any other non-running child)
+ * intact preserves the truthful "was waiting for the user" history — and the
+ * pulse is already stopped by the row-level `cancelled` above.
+ */
+function settleOrphanedTimelineEntry(entry: ToolTimelineEntry): ToolTimelineEntry {
+  if (entry.status !== 'running') return entry;
+  return {
+    ...entry,
+    status: 'cancelled',
+    subagent:
+      entry.subagent && entry.subagent.status === 'running'
+        ? { ...entry.subagent, status: 'cancelled' }
+        : entry.subagent,
+  };
+}
+
 function timelineStatusFromRun(status: AgentRun['status']): ToolTimelineEntryStatus {
   switch (status) {
     case 'completed':
       return 'success';
-    case 'failed':
     case 'cancelled':
-    case 'interrupted':
+      return 'cancelled';
+    case 'failed':
       return 'error';
+    case 'interrupted':
+      // Orphaned by a process exit (e.g. a detached subagent the core lost track
+      // of and settled on next boot) — terminal, but not a user-facing error.
+      // Render muted/static like `cancelled`, not alarming red.
+      return 'cancelled';
     case 'awaiting_user':
     case 'paused':
       return 'awaiting_user';
@@ -515,6 +603,19 @@ const chatRuntimeSlice = createSlice({
       delete state.toolTimelineByThread[action.payload.threadId];
     },
     /**
+     * Optimistically mark a detached background sub-agent as cancelled after the
+     * user confirms a cancel via `openhuman.subagent_cancel`. The aborted run
+     * emits no terminal socket event, so without this the row would keep showing
+     * "running" forever. Located by the subagent's stable `taskId`.
+     */
+    markSubagentCancelled: (state, action: PayloadAction<{ threadId: string; taskId: string }>) => {
+      const { threadId, taskId } = action.payload;
+      const entry = state.toolTimelineByThread[threadId]?.find(e => e.subagent?.taskId === taskId);
+      if (!entry) return;
+      entry.status = 'cancelled';
+      if (entry.subagent) entry.subagent.status = 'cancelled';
+    },
+    /**
      * Append a streamed `subagent_text_delta` / `subagent_thinking_delta`
      * chunk to the ordered transcript of the matching subagent row. The row
      * is located by its synthetic id (`<thread>:subagent:<taskId>:<agentId>`)
@@ -571,14 +672,15 @@ const chatRuntimeSlice = createSlice({
         callId: string;
         toolName: string;
         iteration?: number;
+        args?: unknown;
       }>
     ) => {
-      const { threadId, rowId, callId, toolName, iteration } = action.payload;
+      const { threadId, rowId, callId, toolName, iteration, args } = action.payload;
       const entry = state.toolTimelineByThread[threadId]?.find(e => e.id === rowId);
       if (!entry?.subagent) return;
       const transcript = (entry.subagent.transcript ??= []);
       if (transcript.some(i => i.kind === 'tool' && i.callId === callId)) return;
-      transcript.push({ kind: 'tool', iteration, callId, toolName, status: 'running' });
+      transcript.push({ kind: 'tool', iteration, callId, toolName, status: 'running', args });
     },
     /**
      * Flip a transcript `tool` item to its terminal status when the child
@@ -594,15 +696,17 @@ const chatRuntimeSlice = createSlice({
         success: boolean;
         elapsedMs?: number;
         outputChars?: number;
+        result?: string;
       }>
     ) => {
-      const { threadId, rowId, callId, success, elapsedMs, outputChars } = action.payload;
+      const { threadId, rowId, callId, success, elapsedMs, outputChars, result } = action.payload;
       const entry = state.toolTimelineByThread[threadId]?.find(e => e.id === rowId);
       const item = entry?.subagent?.transcript?.find(i => i.kind === 'tool' && i.callId === callId);
       if (!item || item.kind !== 'tool') return;
       item.status = success ? 'success' : 'error';
       if (elapsedMs != null) item.elapsedMs = elapsedMs;
       if (outputChars != null) item.outputChars = outputChars;
+      if (result != null) item.result = result;
     },
     setTaskBoardForThread: (
       state,
@@ -744,6 +848,31 @@ const chatRuntimeSlice = createSlice({
     clearQueueStatusForThread: (state, action: PayloadAction<{ threadId: string }>) => {
       delete state.queueStatusByThread[action.payload.threadId];
     },
+    /** Append a follow-up the user queued while a turn was streaming. */
+    enqueueFollowup: (
+      state,
+      action: PayloadAction<{ threadId: string; message: ThreadMessage; label: string }>
+    ) => {
+      const { threadId, message, label } = action.payload;
+      const bucket = state.queuedFollowupsByThread[threadId] ?? [];
+      bucket.push({ message, label });
+      state.queuedFollowupsByThread[threadId] = bucket;
+    },
+    /** Drop a single queued follow-up by message id (e.g. the user removed it). */
+    removeFollowup: (state, action: PayloadAction<{ threadId: string; id: string }>) => {
+      const bucket = state.queuedFollowupsByThread[action.payload.threadId];
+      if (!bucket) return;
+      const next = bucket.filter(item => item.message.id !== action.payload.id);
+      if (next.length) {
+        state.queuedFollowupsByThread[action.payload.threadId] = next;
+      } else {
+        delete state.queuedFollowupsByThread[action.payload.threadId];
+      }
+    },
+    /** Drop all queued follow-ups for a thread (turn end / explicit clear). */
+    clearFollowupsForThread: (state, action: PayloadAction<{ threadId: string }>) => {
+      delete state.queuedFollowupsByThread[action.payload.threadId];
+    },
     beginInferenceTurn: (state, action: PayloadAction<{ threadId: string }>) => {
       state.inferenceTurnLifecycleByThread[action.payload.threadId] = 'started';
     },
@@ -754,6 +883,10 @@ const chatRuntimeSlice = createSlice({
     },
     endInferenceTurn: (state, action: PayloadAction<{ threadId: string }>) => {
       delete state.inferenceTurnLifecycleByThread[action.payload.threadId];
+      // The turn finished, so any follow-ups queued behind it are now being
+      // dispatched by the backend — drop the optimistic pills; the queued
+      // texts reappear as real messages on their dispatched turns.
+      delete state.queuedFollowupsByThread[action.payload.threadId];
     },
     clearRuntimeForThread: (state, action: PayloadAction<{ threadId: string }>) => {
       delete state.inferenceStatusByThread[action.payload.threadId];
@@ -772,6 +905,7 @@ const chatRuntimeSlice = createSlice({
       delete state.inferenceTurnLifecycleByThread[action.payload.threadId];
       delete state.pendingApprovalByThread[action.payload.threadId];
       delete state.queueStatusByThread[action.payload.threadId];
+      delete state.queuedFollowupsByThread[action.payload.threadId];
       // Note: artifactsByThread intentionally NOT cleared here. The
       // ArtifactCard renders inline in the message timeline, so the
       // snapshot needs to survive turn boundaries — historic artifacts
@@ -789,6 +923,7 @@ const chatRuntimeSlice = createSlice({
       state.pendingApprovalByThread = {};
       state.artifactsByThread = {};
       state.queueStatusByThread = {};
+      state.queuedFollowupsByThread = {};
     },
     recordChatTurnUsage: (
       state,
@@ -845,7 +980,11 @@ const chatRuntimeSlice = createSlice({
       if (snapshot.lifecycle === 'interrupted') {
         delete state.inferenceStatusByThread[threadId];
         delete state.streamingAssistantByThread[threadId];
-        state.toolTimelineByThread[threadId] = snapshot.toolTimeline.map(toolTimelineFromPersisted);
+        // No live driver remains for this turn — settle any in-flight rows so
+        // their agent names stop pulsing instead of blinking forever.
+        state.toolTimelineByThread[threadId] = snapshot.toolTimeline
+          .map(toolTimelineFromPersisted)
+          .map(settleOrphanedTimelineEntry);
         return;
       }
 
@@ -909,6 +1048,7 @@ export const {
   clearParallelRequest,
   setToolTimelineForThread,
   clearToolTimelineForThread,
+  markSubagentCancelled,
   appendSubagentStreamDelta,
   recordSubagentTranscriptTool,
   resolveSubagentTranscriptTool,
@@ -923,6 +1063,9 @@ export const {
   removeArtifactForThread,
   setQueueStatusForThread,
   clearQueueStatusForThread,
+  enqueueFollowup,
+  removeFollowup,
+  clearFollowupsForThread,
   beginInferenceTurn,
   markInferenceTurnStreaming,
   endInferenceTurn,

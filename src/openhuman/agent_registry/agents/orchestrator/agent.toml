@@ -115,6 +115,13 @@ allowlist = [
     # so there is exactly one canonical route — through this delegate —
     # which keeps the venue-specific approval-gate prompt in scope.
     "markets_agent",
+    # tiny.place specialist. Synthesised into a `use_tinyplace` tool
+    # at agent-build time. Route requests about tiny.place/tinyplace, Agent
+    # Cards, @handles, jobs, proposals, groups, messages, escrow,
+    # registration/status, and x402 payment challenges here. This keeps the
+    # tinyplace_* tool surface behind one worker instead of leaking individual
+    # social-economy actions into the chat agent.
+    "tinyplace_agent",
     # MCP setup specialist (#3039). Synthesised into a `delegate_setup_mcp_server`
     # tool at agent-build time. Route any "install / add / set up / connect an MCP
     # server" request here — the agent owns the full flow: search registries →
@@ -164,20 +171,32 @@ hint = "chat"
 # Direct tools — things the orchestrator calls itself rather than
 # delegating.
 #
-# `composio_list_connections` is the orchestrator's only composio_*
-# tool: it exists so the agent can detect newly-authorised integrations
-# mid-session (the session-start fetch froze the Delegation Guide's
-# connected list). Authorisation, toolkit discovery, action listing,
-# and action execution all live downstream in `integrations_agent` —
-# the orchestrator never calls composio_authorize / composio_list_tools
+# `composio_list_connections` lets the agent detect newly-authorised
+# integrations mid-session (the session-start fetch froze the Delegation
+# Guide's connected list). `composio_connect` lets it raise an inline
+# connect card for ANY toolkit the user asks to connect — including ones
+# not yet connected (#3993); the tool validates the slug against the
+# backend allowlist and the OAuth handoff itself runs inside the card.
+# Toolkit *action* listing and execution still live downstream in
+# `integrations_agent` — the orchestrator never calls composio_list_tools
 # / composio_execute directly.
 named = [
     "read_workspace_state",
     "ask_user_clarification",
+    # "Plan mode as a subagent": before answering or delegating a non-trivial
+    # request, the orchestrator calls `agent_prepare_context` to run the
+    # read-only `context_scout`, which returns a bounded context bundle plus a
+    # recommended plan of next tool calls drawn from this allowlist.
+    "agent_prepare_context",
     "spawn_worker_thread",
     "spawn_async_subagent",
     "spawn_parallel_agents",
     "composio_list_connections",
+    # Inline OAuth connect card (#3993). Free-form `toolkit` slug — the
+    # orchestrator calls this directly to connect a service the user names,
+    # whether or not it is already connected. Validates against the backend
+    # allowlist and raises the in-chat Connect card.
+    "composio_connect",
     # Lightweight MCP discovery — the orchestrator's only `mcp_registry_*`
     # tool, mirroring `composio_list_connections`. Lists the user's installed
     # MCP servers and their live connection state + tool counts so the agent

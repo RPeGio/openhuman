@@ -12,7 +12,7 @@ import {
 import EmptyStateCard from '../components/EmptyStateCard';
 import { ToastContainer } from '../components/intelligence/Toast';
 import PanelPage from '../components/layout/PanelPage';
-import TwoPanelLayout from '../components/layout/TwoPanelLayout';
+import { SidebarContent } from '../components/layout/shell/SidebarSlot';
 import TwoPaneNav from '../components/layout/TwoPaneNav';
 import { SettingsLayoutProvider } from '../components/settings/layout/SettingsLayoutContext';
 import AIPanel from '../components/settings/panels/AIPanel';
@@ -462,8 +462,12 @@ export default function Skills() {
 
   const {
     toolkits: composioToolkits,
+    // Default to an empty map so the component is resilient when a test
+    // mock (or an older hook build) omits the dynamic-catalog field.
+    catalogByToolkit: composioCatalogByToolkit = new Map(),
     connectionByToolkit: composioConnectionByToolkit,
     connectionsByToolkit: composioConnectionsByToolkit,
+    loading: composioLoading,
     error: composioError,
     refresh: refreshComposio,
   } = useComposioIntegrations();
@@ -538,21 +542,57 @@ export default function Skills() {
 
   const composioCatalogToolkits = useMemo(() => {
     const normalizedToolkits = composioToolkits.map(slug => canonicalizeComposioToolkitSlug(slug));
-    const missingKnownToolkits = KNOWN_COMPOSIO_TOOLKITS.filter(
-      slug => !normalizedToolkits.includes(slug)
-    );
-    if (IS_DEV && missingKnownToolkits.length > 0) {
-      console.debug('[skills][composio] filling gaps from KNOWN_COMPOSIO_TOOLKITS', {
+    // Base-list selection (see COMPOSIO_DYNAMIC_CATALOG_PLAN.md / #3933):
+    //  1. Dynamic catalog present → drive the grid straight off the backend.
+    //  2. Still fetching (no catalog yet) → render NOTHING from the hardcoded
+    //     list. The grid shows a loading skeleton instead. This is the fix for
+    //     the "flash of stale hardcoded toolkits" that appeared before the
+    //     backend catalog landed.
+    //  3. Fetch finished with no catalog (a genuine failure, or an older core
+    //     that predates the dynamic catalog) → fall back to the hardcoded
+    //     KNOWN_COMPOSIO_TOOLKITS so the grid is never empty.
+    const dynamicSlugs = Array.from(composioCatalogByToolkit.keys());
+    const hasDynamicCatalog = dynamicSlugs.length > 0;
+    let baseSlugs: readonly string[];
+    let source: 'dynamic-backend' | 'loading' | 'hardcoded-fallback';
+    if (hasDynamicCatalog) {
+      baseSlugs = dynamicSlugs;
+      source = 'dynamic-backend';
+    } else if (composioLoading) {
+      baseSlugs = [];
+      source = 'loading';
+    } else {
+      baseSlugs = KNOWN_COMPOSIO_TOOLKITS;
+      source = 'hardcoded-fallback';
+    }
+
+    if (IS_DEV) {
+      const missingKnownToolkits = KNOWN_COMPOSIO_TOOLKITS.filter(
+        slug => !normalizedToolkits.includes(slug)
+      );
+      console.debug('[skills][composio] building catalog', {
+        source,
+        dynamicCount: dynamicSlugs.length,
         toolkitCount: composioToolkits.length,
         connectionCount: composioConnectionByToolkit.size,
+        loading: composioLoading,
         hasError: Boolean(composioError),
-        missingKnownToolkits,
+        missingKnownToolkits: source === 'hardcoded-fallback' ? missingKnownToolkits : [],
       });
     }
-    return Array.from(new Set([...KNOWN_COMPOSIO_TOOLKITS, ...normalizedToolkits])).sort((a, b) =>
+
+    // Union base slugs with enabled slugs and any connected toolkit so a
+    // connection always renders even if it's missing from the catalog.
+    return Array.from(new Set([...baseSlugs, ...normalizedToolkits])).sort((a, b) =>
       a.localeCompare(b)
     );
-  }, [composioToolkits, composioConnectionByToolkit, composioError]);
+  }, [
+    composioToolkits,
+    composioCatalogByToolkit,
+    composioConnectionByToolkit,
+    composioLoading,
+    composioError,
+  ]);
 
   // Unified item list
   const allItems: SkillItem[] = useMemo(() => {
@@ -600,12 +640,14 @@ export default function Skills() {
       connection: ComposioConnection | undefined;
     }> = [];
     for (const slug of composioCatalogToolkits) {
-      const meta = composioToolkitMeta(slug);
+      const canonical = canonicalizeComposioToolkitSlug(slug);
+      const entry = composioCatalogByToolkit.get(canonical);
+      const meta = composioToolkitMeta(slug, entry);
       const connection = composioConnectionByToolkit.get(meta.slug);
       entries.push({ meta, connection });
     }
     return entries;
-  }, [composioCatalogToolkits, composioConnectionByToolkit]);
+  }, [composioCatalogToolkits, composioCatalogByToolkit, composioConnectionByToolkit]);
 
   const composioFilteredEntries = useMemo(() => {
     const q = searchQuery.toLowerCase();
@@ -813,26 +855,13 @@ export default function Skills() {
 
   return (
     <div className="h-full">
-      <TwoPanelLayout
-        id="connections"
-        // Max-width applied once to the whole panel (sidebar + content) and
-        // centered, matching the settings two-pane shell.
-        className="mx-auto h-full w-full max-w-6xl p-4 pt-6"
-        defaultSidebarVisible
-        defaultSidebarWidth={210}
-        minSidebarWidth={170}
-        maxSidebarWidth={320}
-        seamless
-        sidebar={
+      {/* The Connections navigation lives in the root app sidebar's dynamic region. */}
+      <SidebarContent>
+        <div className="h-full overflow-hidden">
           <TwoPaneNav
             ariaLabel={t('nav.connections')}
             selected={activeTab}
             onSelect={value => handleTabChange(value as ConnectionsTab)}
-            header={
-              <h1 className="text-base font-bold text-stone-900 dark:text-neutral-100">
-                {t('nav.connections')}
-              </h1>
-            }
             groups={[
               {
                 label: t('connections.groups.integrations'),
@@ -912,23 +941,30 @@ export default function Skills() {
               },
             ]}
           />
-        }>
+        </div>
+      </SidebarContent>
+      <div className="mx-auto h-full w-full max-w-5xl">
         {/* Intelligence panels relocated from Settings are themselves PanelPage
             panels (description, no title; the back button hides because the
             Connections sidebar owns navigation), so they fill the content pane
             and own their scroll directly. */}
         {INTELLIGENCE_TABS.has(activeTab) ? (
-          <SettingsLayoutProvider value={{ inTwoPaneShell: true }}>
-            {activeTab === 'llm' && <AIPanel />}
-            {activeTab === 'voice' && <VoicePanel />}
-            {activeTab === 'embeddings' && <EmbeddingsPanel />}
-            {activeTab === 'search' && <SearchPanel />}
-            {activeTab === 'composio-key' && <ComposioPanel />}
-          </SettingsLayoutProvider>
+          // API-keys / provider panels were orphaned flush on the shell — give
+          // them a card surface (the integrations/skills grids below already
+          // have their own card layouts, so they stay flush).
+          <div className="h-full p-4">
+            <div className="h-full overflow-hidden rounded-2xl border border-stone-200 bg-white shadow-soft dark:border-neutral-800 dark:bg-neutral-900">
+              <SettingsLayoutProvider value={{ inTwoPaneShell: true }}>
+                {activeTab === 'llm' && <AIPanel />}
+                {activeTab === 'voice' && <VoicePanel />}
+                {activeTab === 'embeddings' && <EmbeddingsPanel />}
+                {activeTab === 'search' && <SearchPanel />}
+                {activeTab === 'composio-key' && <ComposioPanel />}
+              </SettingsLayoutProvider>
+            </div>
+          </div>
         ) : (
-          <PanelPage
-            description={activeTab === 'composio' ? t('skills.integrationsSubtitle') : undefined}
-            contentClassName="p-4">
+          <PanelPage contentClassName="p-4">
             <div className="mx-auto w-full max-w-3xl space-y-4">
               {/* <div className="flex items-center justify-between gap-2">
               <div className="min-w-0">
@@ -1046,6 +1082,9 @@ export default function Skills() {
                       className="rounded-2xl border border-stone-200 dark:border-neutral-800 bg-white dark:bg-neutral-900 p-3 shadow-soft animate-fade-up"
                       data-walkthrough="skills-grid"
                       data-testid="composio-integrations-card">
+                      <p className="px-1 pb-3 text-xs leading-relaxed text-stone-500 dark:text-neutral-400">
+                        {t('skills.integrationsSubtitle')}
+                      </p>
                       {showLocalComposioApiKeyBanner && (
                         <ComposioApiKeyEmptyState
                           onOpenSettings={() => handleTabChange('composio-key')}
@@ -1062,7 +1101,33 @@ export default function Skills() {
                         </div>
                       )}
                       {!showLocalComposioApiKeyBanner &&
-                        (composioSortedEntries.length > 0 ? (
+                        // While the dynamic catalog is still being fetched and we
+                        // have nothing real to show yet, render a loading skeleton
+                        // instead of the hardcoded toolkit list. The hardcoded
+                        // KNOWN_COMPOSIO_TOOLKITS list is only used as a post-fetch
+                        // fallback (see composioCatalogToolkits), never during the
+                        // in-flight loading window (#3933).
+                        (composioLoading && composioSortedEntries.length === 0 ? (
+                          <div
+                            className="grid gap-2 sm:gap-3"
+                            data-testid="composio-integrations-loading"
+                            role="status"
+                            aria-label={t('skills.loadingIntegrations')}
+                            aria-busy="true"
+                            style={{
+                              gridTemplateColumns: 'repeat(auto-fill, minmax(5.5rem, 1fr))',
+                              gridAutoRows: '6.5rem',
+                            }}>
+                            {Array.from({ length: 12 }).map((_, i) => (
+                              <div
+                                key={i}
+                                data-testid="composio-skeleton-tile"
+                                aria-hidden="true"
+                                className="animate-pulse rounded-xl border border-stone-200 dark:border-neutral-800 bg-stone-100 dark:bg-neutral-800/60"
+                              />
+                            ))}
+                          </div>
+                        ) : composioSortedEntries.length > 0 ? (
                           <div
                             className="grid gap-2 sm:gap-3"
                             style={{
@@ -1134,7 +1199,7 @@ export default function Skills() {
             </div>
           </PanelPage>
         )}
-      </TwoPanelLayout>
+      </div>
 
       {channelModalDef && (
         <ChannelSetupModal definition={channelModalDef} onClose={() => setChannelModalDef(null)} />

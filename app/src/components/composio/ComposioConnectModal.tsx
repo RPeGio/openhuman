@@ -298,7 +298,9 @@ export default function ComposioConnectModal({
           if (state === 'error') {
             stopPolling();
             setPhase('error');
-            setError(`${t('composio.connect.connectionFailed')} (status: ${hit.status}).`);
+            setError(
+              t('composio.connect.connectionFailed').replace('{status}', String(hit.status))
+            );
             return;
           }
           if (state === 'expired') {
@@ -539,7 +541,7 @@ export default function ComposioConnectModal({
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
         setPhase('error');
-        setError(`${t('composio.connect.disconnectFailed')}: ${msg}`);
+        setError(t('composio.connect.disconnectFailed').replace('{msg}', msg));
         setClearMemoryOnDisconnect(false);
       }
     },
@@ -1020,7 +1022,7 @@ function RequiredFieldsForm({
                 value={value}
                 autoFocus={autoFocusFirst && idx === 0}
                 onChange={(e: ChangeEvent<HTMLInputElement>) => onChange(field.key, e.target.value)}
-                placeholder={field.placeholder}
+                placeholder={field.placeholderKey ? t(field.placeholderKey) : undefined}
                 aria-describedby={hintId}
                 aria-invalid={!!errorText}
                 className="flex-1 min-w-0 px-3 py-2 text-sm text-stone-900 dark:text-neutral-100 placeholder:text-stone-400 dark:placeholder:text-neutral-500 bg-transparent focus:outline-none"

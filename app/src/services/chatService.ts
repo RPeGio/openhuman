@@ -301,6 +301,12 @@ export interface ChatSubagentToolCallEvent {
   skill_id: string;
   /** Provider-assigned tool call id. */
   tool_call_id: string;
+  /**
+   * Full arguments the sub-agent invoked the tool with, so the processing
+   * drawer can show *what exactly* the child did. Absent for tools called
+   * with no/`null` arguments.
+   */
+  args?: unknown;
   subagent?: SubagentProgressDetail;
 }
 
@@ -313,7 +319,11 @@ export interface ChatSubagentToolResultEvent {
   skill_id: string;
   tool_call_id: string;
   success: boolean;
-  /** Stringified JSON `{ output_chars, elapsed_ms }` matching `tool_result`. */
+  /**
+   * The child tool's actual output text, so the drawer can show what came
+   * back. Size/timing still arrive via `subagent.output_chars` /
+   * `subagent.elapsed_ms`.
+   */
   output?: string;
   subagent?: SubagentProgressDetail;
 }
@@ -1047,6 +1057,26 @@ export async function chatCancel(threadId: string): Promise<boolean> {
     return true;
   } catch {
     return false;
+  }
+}
+
+/**
+ * Clear the run-queue (steer/followup/collect lanes) for a thread via core RPC.
+ * Used when the user dismisses queued follow-ups so the backend drops them
+ * instead of dispatching them after the current turn. Returns the number of
+ * dropped messages on success, or `null` when the RPC fails — the caller must
+ * distinguish these: on failure the backend queue is still intact and WILL
+ * dispatch the follow-ups, so the UI must keep the pills rather than hide them.
+ */
+export async function chatClearQueue(threadId: string): Promise<number | null> {
+  try {
+    const res = await callCoreRpc<{ dropped?: number }>({
+      method: 'openhuman.channel_web_queue_clear',
+      params: { thread_id: threadId },
+    });
+    return res?.dropped ?? 0;
+  } catch {
+    return null;
   }
 }
 

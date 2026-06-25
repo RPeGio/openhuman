@@ -23,6 +23,15 @@ impl Provider for OpenAiCompatibleProvider {
         }
     }
 
+    fn prompt_cache_capabilities(
+        &self,
+    ) -> crate::openhuman::inference::provider::traits::PromptCacheCapabilities {
+        // Derive from the configured slug — conservative for unknown / custom
+        // providers (#3939). The OpenHuman backend wraps this provider but
+        // declares its own grouping-aware caps on `OpenHumanBackendProvider`.
+        super::prompt_cache_for_compatible_slug(&self.name)
+    }
+
     async fn chat_with_system(
         &self,
         system_prompt: Option<&str>,
@@ -91,7 +100,7 @@ impl Provider for OpenAiCompatibleProvider {
         {
             Ok(response) => response,
             Err(chat_error) => {
-                if self.supports_responses_fallback {
+                if self.responses_fallback_active() {
                     let detail = super::super::format_error_chain(&chat_error);
                     return self
                         .chat_via_responses(credential, &fallback_messages, model, None)
@@ -122,7 +131,7 @@ impl Provider for OpenAiCompatibleProvider {
                 return Err(err);
             }
 
-            if status == reqwest::StatusCode::NOT_FOUND && self.supports_responses_fallback {
+            if status == reqwest::StatusCode::NOT_FOUND && self.responses_fallback_active() {
                 return self
                     .chat_via_responses(credential, &fallback_messages, model, None)
                     .await
@@ -189,6 +198,20 @@ impl Provider for OpenAiCompatibleProvider {
                 &error,
             ) {
                 super::super::log_byo_provider_auth_failure(
+                    "chat_completions",
+                    self.name.as_str(),
+                    Some(model),
+                    status,
+                );
+            } else if super::super::is_provider_insufficient_credits_402(status, &error) {
+                // Insufficient-credits 402: the user's own BYO provider account
+                // is out of balance — a flat billing fact, not a reservation-
+                // window error, so there is NO local max_tokens lever to apply.
+                // Demote to info instead of paging on every retry; this is the
+                // complete classification for a genuinely-unpreventable
+                // BYO-balance condition (TAURI-RUST-4QF — DeepSeek "Insufficient
+                // Balance"; same class as the native_chat arm added for -C62).
+                super::super::log_provider_insufficient_credits_402(
                     "chat_completions",
                     self.name.as_str(),
                     Some(model),
@@ -274,7 +297,7 @@ impl Provider for OpenAiCompatibleProvider {
         {
             Ok(response) => response,
             Err(chat_error) => {
-                if self.supports_responses_fallback {
+                if self.responses_fallback_active() {
                     let detail = super::super::format_error_chain(&chat_error);
                     return self
                         .chat_via_responses(credential, &effective_messages, model, None)
@@ -303,7 +326,7 @@ impl Provider for OpenAiCompatibleProvider {
                     return Err(err);
                 }
 
-                if self.supports_responses_fallback {
+                if self.responses_fallback_active() {
                     return self
                         .chat_via_responses(credential, &effective_messages, model, None)
                         .await
@@ -639,7 +662,7 @@ impl Provider for OpenAiCompatibleProvider {
         {
             Ok(response) => response,
             Err(chat_error) => {
-                if self.supports_responses_fallback {
+                if self.responses_fallback_active() {
                     let detail = super::super::format_error_chain(&chat_error);
                     return self
                         .chat_via_responses(
@@ -695,7 +718,7 @@ impl Provider for OpenAiCompatibleProvider {
                 return Err(err);
             }
 
-            if status == reqwest::StatusCode::NOT_FOUND && self.supports_responses_fallback {
+            if status == reqwest::StatusCode::NOT_FOUND && self.responses_fallback_active() {
                 return self
                     .chat_via_responses(credential, &effective_messages, model, request.max_tokens)
                     .await
@@ -772,6 +795,17 @@ impl Provider for OpenAiCompatibleProvider {
                 // so demote to info instead of paging on every retry
                 // (TAURI-RUST-C62).
                 super::super::log_provider_insufficient_credits_402(
+                    "native_chat",
+                    self.name.as_str(),
+                    Some(model),
+                    status,
+                );
+            } else if super::super::is_provider_quota_exhausted(&error) {
+                // Upstream plan quota spent (e.g. Kiro `MONTHLY_REQUEST_COUNT`),
+                // sometimes wrapped in a 500 envelope so the credits matcher
+                // above (402-gated) misses it — no local lever, demote instead
+                // of paging once per memory-extraction retry (TAURI-RUST-C9A).
+                super::super::log_provider_quota_exhausted(
                     "native_chat",
                     self.name.as_str(),
                     Some(model),
@@ -996,6 +1030,23 @@ impl Provider for OpenAiCompatibleProvider {
                         Some(model_owned.as_str()),
                         status,
                     );
+                } else if crate::openhuman::inference::provider::is_provider_insufficient_credits_402(
+                    status,
+                    &raw_error,
+                ) {
+                    // Insufficient-credits 402: the user's own BYO provider
+                    // account is out of balance — a flat billing fact, not a
+                    // reservation-window error, so there is NO local max_tokens
+                    // lever to apply. Demote to info instead of paging on every
+                    // retry; complete classification for a genuinely-
+                    // unpreventable BYO-balance condition
+                    // (TAURI-RUST-4QF — DeepSeek "Insufficient Balance").
+                    crate::openhuman::inference::provider::log_provider_insufficient_credits_402(
+                        "stream_chat",
+                        provider_name.as_str(),
+                        Some(model_owned.as_str()),
+                        status,
+                    );
                 } else if crate::openhuman::inference::provider::should_report_provider_http_failure(
                     status,
                 ) {
@@ -1213,6 +1264,23 @@ impl Provider for OpenAiCompatibleProvider {
                         Some(model_owned.as_str()),
                         status,
                     );
+                } else if crate::openhuman::inference::provider::is_provider_insufficient_credits_402(
+                    status,
+                    &raw_error,
+                ) {
+                    // Insufficient-credits 402: the user's own BYO provider
+                    // account is out of balance — a flat billing fact, not a
+                    // reservation-window error, so there is NO local max_tokens
+                    // lever to apply. Demote to info instead of paging on every
+                    // retry; complete classification for a genuinely-
+                    // unpreventable BYO-balance condition
+                    // (TAURI-RUST-4QF — DeepSeek "Insufficient Balance").
+                    crate::openhuman::inference::provider::log_provider_insufficient_credits_402(
+                        "stream_chat_history",
+                        provider_name.as_str(),
+                        Some(model_owned.as_str()),
+                        status,
+                    );
                 } else if crate::openhuman::inference::provider::should_report_provider_http_failure(
                     status,
                 ) {
@@ -1257,6 +1325,10 @@ impl Provider for OpenAiCompatibleProvider {
         Ok(())
     }
 
+    fn is_local_provider(&self) -> bool {
+        self.local_provider_kind.is_some()
+    }
+
     /// Resolve the effective context window for pre-dispatch trimming.
     ///
     /// For cloud (non-local) providers this is the static model table. For
@@ -1284,6 +1356,20 @@ impl Provider for OpenAiCompatibleProvider {
             model,
             Some(kind),
         )
+    }
+
+    /// Authoritative runtime-loaded window: only the value the local runtime
+    /// genuinely reports. Today that is LM Studio's native `/api/v0/models`
+    /// `loaded_context_length`. For every other case — cloud, llama.cpp / vLLM
+    /// (no loaded window endpoint), or a missing probe — we return `None`
+    /// rather than a guess, so the engine's hard pre-dispatch abort never fires
+    /// on an estimated window (Codex P1 review on PR #3771 / TAURI-RUST-6V0).
+    async fn loaded_context_window(&self, model: &str) -> Option<u64> {
+        use crate::openhuman::inference::local::profile::LocalProviderKind;
+        if self.local_provider_kind == Some(LocalProviderKind::LmStudio) {
+            return self.lm_studio_loaded_context_window(model).await;
+        }
+        None
     }
 }
 

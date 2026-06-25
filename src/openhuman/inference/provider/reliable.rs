@@ -50,6 +50,13 @@ pub(crate) fn is_non_retryable(err: &anyhow::Error) -> bool {
     if crate::core::observability::is_session_expired_message(&msg) {
         return true;
     }
+    // Monthly-quota / usage-limit exhaustion (e.g. Kiro `MONTHLY_REQUEST_COUNT`,
+    // possibly wrapped in a 500 envelope so `structured_http_4xx` can't see the
+    // inner 402) is terminal for the period — retrying a spent plan quota only
+    // multiplies wasted calls and Sentry events (TAURI-RUST-C9A).
+    if crate::openhuman::inference::provider::body_indicates_quota_exhausted(&msg) {
+        return true;
+    }
 
     if let Some(reqwest_err) = err.downcast_ref::<reqwest::Error>() {
         if let Some(status) = reqwest_err.status() {
@@ -448,6 +455,45 @@ impl Provider for ReliableProvider {
             }
         }
         Ok(())
+    }
+
+    /// Delegate to the primary provider so a wrapped local runtime reports its
+    /// runtime-loaded window (LM Studio `n_ctx`) for pre-dispatch trimming
+    /// instead of the static-table default (#3550 / TAURI-RUST-6V0).
+    async fn effective_context_window(&self, model: &str) -> Option<u64> {
+        match self.providers.first() {
+            Some((_, provider)) => provider.effective_context_window(model).await,
+            None => crate::openhuman::inference::context_window_for_model(model),
+        }
+    }
+
+    /// Delegate to the primary provider so the engine's pre-dispatch
+    /// un-evictable-prefix guard fires for a wrapped local model (#3550).
+    fn is_local_provider(&self) -> bool {
+        self.providers
+            .first()
+            .map(|(_, p)| p.is_local_provider())
+            .unwrap_or(false)
+    }
+
+    /// Delegate the model-aware locality to the primary provider so a wrapped
+    /// router resolves `model` to its actual (possibly local) provider for the
+    /// engine's pre-dispatch guard (#3550 / PR #3771).
+    fn is_local_provider_for_model(&self, model: &str) -> bool {
+        self.providers
+            .first()
+            .map(|(_, p)| p.is_local_provider_for_model(model))
+            .unwrap_or(false)
+    }
+
+    /// Delegate the authoritative runtime-loaded window to the primary provider
+    /// so the engine's hard pre-dispatch abort sees the wrapped local runtime's
+    /// loaded `n_ctx` (#3550 / PR #3771).
+    async fn loaded_context_window(&self, model: &str) -> Option<u64> {
+        match self.providers.first() {
+            Some((_, provider)) => provider.loaded_context_window(model).await,
+            None => None,
+        }
     }
 
     async fn chat_with_system(

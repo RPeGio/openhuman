@@ -123,6 +123,22 @@ fn filter_wildcard_includes_all_minus_disallowed() {
 }
 
 #[test]
+fn filter_wildcard_honours_disallowed_prefix_entries() {
+    let parent: Vec<Box<dyn Tool>> = vec![
+        stub("alpha"),
+        stub("tinyplace_registry_register"),
+        stub("tinyplace_marketplace_buy_identity"),
+        stub("gamma"),
+    ];
+    let mut def = make_def_named_tools(&[]);
+    def.tools = ToolScope::Wildcard;
+    def.disallowed_tools = vec!["tinyplace_*".into()];
+    let idx = filter_tool_indices(&parent, &def.tools, &def.disallowed_tools, None);
+    let names: Vec<&str> = idx.iter().map(|&i| parent[i].name()).collect();
+    assert_eq!(names, vec!["alpha", "gamma"]);
+}
+
+#[test]
 fn filter_skill_filter_restricts_to_prefix() {
     let parent: Vec<Box<dyn Tool>> = vec![
         stub("notion__search"),
@@ -323,6 +339,7 @@ fn make_parent(provider: Arc<dyn Provider>, tools: Vec<Box<dyn Tool>>) -> Parent
         provider,
         all_tools: Arc::new(tools),
         all_tool_specs: Arc::new(tool_specs),
+        visible_tool_names: std::collections::HashSet::new(),
         model_name: "test-model".into(),
         temperature: 0.5,
         workspace_dir: std::env::temp_dir(),
@@ -1266,16 +1283,21 @@ fn resolve_subagent_provider_hint_with_config_routes_via_factory() {
     // We don't assert the *resulting* provider identity here (the
     // factory may return a fresh OpenHuman backend or whatever
     // primary_cloud resolves to), but we DO assert the resolved model
-    // matches the workload's configured exact id — not the legacy
-    // `{workload}-v1` synthesis.
+    // is the workload's canonical managed tier — NOT `default_model`,
+    // and NOT the parent's model.
+    //
+    // Regression (#hint-routing): the managed backend used to ignore the
+    // workload role and return `default_model`, so `hint = "agentic"`
+    // silently ran on whatever `default_model` was (here `chat-v1`).
+    // `make_openhuman_backend` now pins specialised roles to their tier,
+    // so `agentic` resolves to `agentic-v1` regardless of `default_model`.
     use crate::openhuman::config::Config;
     let mut config = Config::default();
-    // Route `agentic` to OpenHuman backend explicitly. The backend returns
-    // the configured default_model. Use `coding-v1` — a recognized tier
-    // that the factory validation accepts and that differs from the old
-    // `agentic-v1` synthesis, making the assertion meaningful.
+    // Route `agentic` to the OpenHuman backend explicitly, and set a
+    // distinct `default_model` so the assertion proves the role — not the
+    // global default — drives the resolved tier.
     config.agentic_provider = Some("openhuman".to_string());
-    config.default_model = Some("coding-v1".to_string());
+    config.default_model = Some("chat-v1".to_string());
 
     let parent: Arc<dyn Provider> = ScriptedProvider::new(vec![]);
     let (_resolved_provider, resolved_model) = super::resolve_subagent_provider(
@@ -1288,9 +1310,9 @@ fn resolve_subagent_provider_hint_with_config_routes_via_factory() {
         None,
     );
     assert_eq!(
-        resolved_model, "coding-v1",
-        "Hint must use the factory-resolved exact model, not synthesise `agentic-v1` \
-         and not fall back to parent's model"
+        resolved_model, "agentic-v1",
+        "Hint must resolve to the workload's managed tier (agentic-v1), not \
+         fall back to default_model (chat-v1) or the parent's model"
     );
 }
 
@@ -1456,4 +1478,67 @@ fn nested_subagent_dispatch_runs_on_a_constrained_worker_stack() {
          answer, got: {}",
         outcome.output
     );
+}
+
+// ── Repro: issue #3152 — near-miss write slug fails to resolve ──────
+//
+// The model emits `NOTION_SEARCH_NOTION` (drops the `_PAGE` suffix). The
+// real action `NOTION_SEARCH_NOTION_PAGE` is the unique superstring, yet
+// find_action's three tiers (exact / case-insensitive / normalized) all
+// miss → None → lazy registration never fires → allowlist gate blocks the
+// write. Asserts DESIRED post-fix behaviour → RED until the unique
+// prefix/superstring resolution tier lands. Must stay conservative: a
+// fabricated slug with no unique match must still resolve to None (covered
+// by `lazy_resolver_tolerates_near_miss_slugs`).
+#[test]
+fn repro_3152_near_miss_write_slug_resolves_uniquely() {
+    use crate::openhuman::context::prompt::ConnectedIntegrationTool;
+    let mk = |name: &str| ConnectedIntegrationTool {
+        name: name.into(),
+        description: "d".into(),
+        parameters: None,
+    };
+    let resolver = LazyToolkitResolver {
+        config: std::sync::Arc::new(crate::openhuman::config::Config::default()),
+        actions: vec![
+            mk("NOTION_SEARCH_NOTION_PAGE"),
+            mk("NOTION_CREATE_NOTION_PAGE"),
+            mk("NOTION_FETCH_DATA"),
+        ],
+    };
+    let resolved = resolver
+        .resolve("NOTION_SEARCH_NOTION")
+        .expect("#3152: near-miss write slug must resolve to its unique superstring");
+    assert_eq!(resolved.name(), "NOTION_SEARCH_NOTION_PAGE");
+}
+
+// ── Guard: #3152 prefix tier must stay strictly unique ──────────────
+//
+// When a truncated slug prefix-matches MORE than one catalogued action,
+// the resolver must refuse rather than guess — a mis-dispatched write
+// could create/update the wrong resource (data-integrity). Also asserts
+// the length gate: a too-short request never fans out.
+#[test]
+fn prefix_tier_refuses_ambiguous_and_short_slugs() {
+    use crate::openhuman::context::prompt::ConnectedIntegrationTool;
+    let mk = |name: &str| ConnectedIntegrationTool {
+        name: name.into(),
+        description: "d".into(),
+        parameters: None,
+    };
+    let resolver = LazyToolkitResolver {
+        config: std::sync::Arc::new(crate::openhuman::config::Config::default()),
+        actions: vec![
+            mk("NOTION_SEARCH_NOTION_PAGE"),
+            mk("NOTION_SEARCH_NOTION_DATABASE"),
+            mk("NOTION_CREATE_NOTION_PAGE"),
+        ],
+    };
+    // `NOTION_SEARCH_NOTION` is a prefix of TWO actions → ambiguous → None.
+    assert!(
+        resolver.resolve("NOTION_SEARCH_NOTION").is_none(),
+        "#3152: ambiguous prefix must not silently dispatch to a guess"
+    );
+    // Short slug below the length gate never engages the prefix tier.
+    assert!(resolver.resolve("NOTION").is_none());
 }

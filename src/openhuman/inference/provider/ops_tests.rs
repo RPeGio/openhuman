@@ -682,12 +682,37 @@ mod context_window_exceeded_suppression {
     }
 
     #[test]
+    fn classifies_lmstudio_n_keep_exceeds_n_ctx_body() {
+        // TAURI-RUST-6V0: LM Studio / llama.cpp reject a prompt whose
+        // un-evictable prefix (`n_keep`) is larger than the model's loaded
+        // context (`n_ctx`). The user loaded the model with too small a
+        // context length; the remediation lives in the user's local server,
+        // so the matcher must demote this from Sentry. Verbatim wire body.
+        let body = "lmstudio API error (400 Bad Request): {\"error\":\"The number of tokens to keep from the initial prompt is greater than the context length (n_keep: 10978 >= n_ctx: 8192). Try to load the model with a larger context length, or provide a shorter input.\"}";
+        assert!(
+            is_context_window_exceeded_message(body),
+            "LM Studio n_keep >= n_ctx body must classify as context-window overflow"
+        );
+        // Both anchors fire independently: the `greater than the context
+        // length` phrase AND the paired `n_keep`/`n_ctx` diagnostic.
+        assert!(is_context_window_exceeded_message(
+            "request rejected: prompt is greater than the context length of the loaded model"
+        ));
+        assert!(is_context_window_exceeded_message(
+            "n_keep: 9000 >= n_ctx: 4096"
+        ));
+    }
+
+    #[test]
     fn does_not_match_unrelated_bodies() {
         for body in [
             "rate limit exceeded, retry after 30s",
             "Invalid request: model not found",
             "Insufficient budget",
             "tool call exceeded the allowed budget",
+            // Only one of the paired n_keep/n_ctx tokens present — must NOT
+            // match (guards the paired-anchor arm against bare n_ctx logging).
+            "loaded model with n_ctx: 8192 and 32 layers",
         ] {
             assert!(
                 !is_context_window_exceeded_message(body),
@@ -1209,6 +1234,41 @@ async fn api_error_byo_auth_failure_returns_message_via_demoted_branch() {
             .contains("invalid or missing api key"),
         "sanitized upstream body must propagate to the caller: {msg}"
     );
+}
+
+/// End-to-end through `api_error`: a 500-wrapped monthly-quota refusal (the
+/// Kiro IDE proxy nests its 402 / `MONTHLY_REQUEST_COUNT` inside a 500
+/// envelope, TAURI-RUST-C9A) returns the sanitized provider error to the UI
+/// while routing through the quota-exhausted demote branch — *before* the
+/// `should_report_provider_http_failure(500)` status gate that would otherwise
+/// page once per memory-extraction retry.
+#[tokio::test]
+async fn api_error_monthly_quota_returns_message_via_demoted_branch() {
+    let body = "{\"error\":{\"message\":\"HTTP 402 from Kiro IDE: \
+        {\\\"message\\\":\\\"You have reached the limit.\\\",\
+        \\\"reason\\\":\\\"MONTHLY_REQUEST_COUNT\\\"}\",\"type\":\"server_error\"}}";
+    let http_response = axum::http::Response::builder()
+        .status(StatusCode::INTERNAL_SERVER_ERROR)
+        .body(body.to_string())
+        .expect("build 500 response");
+    let response = reqwest::Response::from(http_response);
+
+    let err = api_error("kiro", response).await;
+    let msg = err.to_string();
+    assert!(
+        msg.contains("kiro API error (500"),
+        "error must still carry the provider/status prefix for the UI: {msg}"
+    );
+    assert!(
+        msg.contains("MONTHLY_REQUEST_COUNT"),
+        "sanitized upstream quota body must propagate to the caller: {msg}"
+    );
+    // The body must classify as quota-exhausted so the demote branch — not the
+    // 500 status gate — handles it.
+    assert!(is_provider_quota_exhausted(body));
+    assert!(should_report_provider_http_failure(
+        StatusCode::INTERNAL_SERVER_ERROR
+    ));
 }
 
 /// `publish_backend_session_expired` must emit a `SessionExpired` event on

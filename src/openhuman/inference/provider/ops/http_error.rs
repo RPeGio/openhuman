@@ -214,6 +214,76 @@ pub fn log_provider_insufficient_credits_402(
     );
 }
 
+/// Whether a provider non-2xx response is a deterministic **monthly-quota /
+/// usage-limit exhausted** user-state error — the user's third-party plan has
+/// spent its allotment for the period and no request will succeed until it
+/// resets (a billing/plan state OpenHuman has no lever over).
+///
+/// Distinct from [`is_provider_insufficient_credits_402`] in two ways:
+/// 1. The signal is a *usage-quota cap* ("you have reached the limit",
+///    `MONTHLY_REQUEST_COUNT`), not an account balance.
+/// 2. The upstream proxy may wrap its own 402 inside a **500** envelope, e.g.
+///    Kiro IDE: `kiro API error (500 Internal Server Error): {"error":\
+///    {"message":"HTTP 402 from Kiro IDE: {\"reason\":\"MONTHLY_REQUEST_COUNT\"}"…}}`.
+///    So this is **status-agnostic** — matched against the body like
+///    [`is_context_window_exceeded_message`] — because gating on a 402
+///    transport status (as the credits matcher does) would let the 500-wrapped
+///    flood straight through to [`should_report_provider_http_failure`]
+///    (TAURI-RUST-C9A: 9k events from a single quota-capped user, retried per
+///    memory-extraction attempt).
+///
+/// Keyed on quota-specific wording only, so a generic 500 outage (or a 429
+/// rate-limit, which has its own transient handling) is not swallowed. Covered
+/// by a verbatim-body test so a provider wording drift fails CI.
+pub fn is_provider_quota_exhausted(body: &str) -> bool {
+    body_indicates_quota_exhausted(body)
+}
+
+/// Phrase-level matcher for a provider monthly-quota / usage-limit exhausted
+/// body. Single source of truth for the quota-phrase set, shared by the
+/// emit-site guard [`is_provider_quota_exhausted`] and the `before_send`
+/// defense-in-depth filter
+/// [`crate::core::observability::is_quota_exhausted_event`] (which matches the
+/// formatted `<provider> API error (…): <body>` message so the demotion reaches
+/// every compatible-provider HTTP path, not just `Provider::chat()`'s
+/// `native_chat` cascade). TAURI-RUST-C9A.
+pub fn body_indicates_quota_exhausted(body: &str) -> bool {
+    let lower = body.to_ascii_lowercase();
+    lower.contains("monthly_request_count")
+        || lower.contains("monthly request")
+        || lower.contains("monthly limit")
+        || lower.contains("monthly quota")
+        || lower.contains("quota exceeded")
+        || lower.contains("usage limit exceeded")
+        // "reached the limit" alone is ambiguous (rate-limit, token-limit), so
+        // require a quota/plan/request/monthly co-marker to keep the blast
+        // radius on plan-quota exhaustion only.
+        || (lower.contains("reached the limit")
+            && (lower.contains("request")
+                || lower.contains("quota")
+                || lower.contains("monthly")
+                || lower.contains("plan")))
+}
+
+pub fn log_provider_quota_exhausted(
+    operation: &str,
+    provider: &str,
+    model: Option<&str>,
+    status: reqwest::StatusCode,
+) {
+    tracing::info!(
+        domain = "llm_provider",
+        operation = operation,
+        provider = provider,
+        model = model.unwrap_or(""),
+        status = status.as_u16(),
+        failure = "non_2xx",
+        kind = "quota_exhausted",
+        "[llm_provider] {operation} provider monthly-quota exhausted — third-party plan limit \
+         reached (no local lever), not reporting to Sentry"
+    );
+}
+
 /// Whether a provider non-2xx response is a deterministic
 /// **configuration-rejection** user-state error (unknown model id,
 /// abstract tier leaked to a custom provider, model-specific temperature
@@ -334,8 +404,23 @@ pub fn is_context_window_exceeded_message(body: &str) -> bool {
         "context size has been exceeded",
         "prompt is too long",
         "input is too long",
+        // LM Studio / llama.cpp un-evictable-prefix overflow (TAURI-RUST-6V0):
+        // `"The number of tokens to keep from the initial prompt is greater
+        //   than the context length (n_keep: 10978 >= n_ctx: 8192). Try to
+        //   load the model with a larger context length, …"`. The user's local
+        // model was loaded with an `n_ctx` smaller than the system/un-evictable
+        // prefix; the remediation lives in the user's local server (reload with
+        // a larger context), so this is expected user-state, not a product bug.
+        "greater than the context length",
     ];
     if CONTEXT_HINTS.iter().any(|hint| lower.contains(hint)) {
+        return true;
+    }
+
+    // LM Studio / llama.cpp emit the overflow as a paired `n_keep … n_ctx`
+    // diagnostic. Require BOTH tokens so the arm stays anchored to that exact
+    // shape (TAURI-RUST-6V0) and never broadens to unrelated `n_ctx` logging.
+    if lower.contains("n_keep") && lower.contains("n_ctx") {
         return true;
     }
 
@@ -494,6 +579,123 @@ pub fn log_byo_provider_auth_failure(
     );
 }
 
+/// Whether a `401` is the OpenAI **OAuth** (ChatGPT-subscription / Codex)
+/// access token having expired — distinct from a misconfigured BYO API key.
+///
+/// The ChatGPT/Codex OAuth Responses endpoint returns
+/// `{"error":{"code":"token_expired","message":"Provided authentication token
+/// is expired. Please try signing in again."}}` once the OAuth access token
+/// lapses. The valid-`refresh_token` case already self-heals at credential
+/// resolution time (`openai_oauth::lookup_openai_oauth_credentials` refreshes
+/// proactively within a 2-min skew, and the chat provider is rebuilt per
+/// request), so the residual events that reach this 401 are ones where the
+/// refresh token is **absent or revoked** — the user must reconnect OpenAI.
+/// That is deterministic user-state, not a server bug, and reporting it spams
+/// Sentry (TAURI-RUST-8FQ: 97,938 events / 31 users).
+///
+/// Keyed on the OAuth-expiry body markers, which an API-key rejection never
+/// emits (those say "incorrect api key" — caught by
+/// [`is_byo_provider_auth_failure_http`] instead). The OpenHuman **backend**
+/// provider is excluded — its `401`/`403` is app-session expiry handled by
+/// [`publish_backend_session_expired`]. Unlike that path, this does **not**
+/// publish [`crate::core::event_bus::DomainEvent::SessionExpired`]: an expired
+/// *provider* OAuth token must not tear down the OpenHuman app session.
+pub fn is_openai_oauth_session_expired_http(
+    provider: &str,
+    status: reqwest::StatusCode,
+    body: &str,
+) -> bool {
+    if status.as_u16() != 401 {
+        tracing::debug!(
+            domain = "llm_provider",
+            operation = "http_error_classifier",
+            provider = provider,
+            status = status.as_u16(),
+            matched = false,
+            reason = "openai_oauth_session_expired_probe:non_401",
+            "[llm_provider] OpenAI OAuth session-expiry classifier skipped — status is not 401"
+        );
+        return false;
+    }
+    if provider == openhuman_backend::PROVIDER_LABEL {
+        tracing::debug!(
+            domain = "llm_provider",
+            operation = "http_error_classifier",
+            provider = provider,
+            status = status.as_u16(),
+            matched = false,
+            reason = "openai_oauth_session_expired_probe:backend_excluded",
+            "[llm_provider] OpenAI OAuth session-expiry classifier skipped — backend owns app-session expiry"
+        );
+        return false;
+    }
+    let matched = is_openai_oauth_session_expired_message(body);
+    tracing::debug!(
+        domain = "llm_provider",
+        operation = "http_error_classifier",
+        provider = provider,
+        status = status.as_u16(),
+        matched,
+        reason = "openai_oauth_session_expired_probe",
+        "[llm_provider] evaluated OpenAI OAuth session-expiry classifier"
+    );
+    matched
+}
+
+/// Message-level half of [`is_openai_oauth_session_expired_http`]: matches the
+/// OpenAI OAuth session-expiry body markers without a status/provider gate.
+///
+/// The provider HTTP layer demotes its own per-attempt event via the `_http`
+/// gate, but the same `anyhow::bail!` string is re-raised at the JSON-RPC
+/// boundary (`core::jsonrpc` → `report_error_or_expected` →
+/// `core::observability::expected_error_kind`), which has only the message
+/// string — no status. This predicate lets that central classifier demote the
+/// re-report too, so an RPC-triggered chat/test call does not leak the event
+/// the `_http` gate already suppressed (TAURI-RUST-8FQ). Mirrors the
+/// `is_provider_config_rejection_message` / `_http` split.
+///
+/// `token_expired` is OpenAI's OAuth error code; the prose variants cover
+/// sanitized/reworded bodies. An API-key rejection never carries these (it
+/// emits "incorrect api key" / "invalid_api_key"), and the backend app-session
+/// "invalid token" / "please sign in again" wording differs, so this cannot
+/// swallow a real misconfig or a backend session-expiry.
+pub fn is_openai_oauth_session_expired_message(message: &str) -> bool {
+    const OAUTH_EXPIRY_MARKERS: &[&str] = &[
+        "token_expired",
+        "authentication token is expired",
+        "please try signing in again",
+    ];
+    let lower = message.to_ascii_lowercase();
+    OAUTH_EXPIRY_MARKERS
+        .iter()
+        .any(|marker| lower.contains(marker))
+}
+
+/// Demote an OpenAI OAuth session-expiry `401` to an info log (user-state,
+/// not a server bug) instead of reporting it to Sentry. The message tells the
+/// user to reconnect OpenAI, which is the only recovery once the refresh token
+/// is gone. See [`is_openai_oauth_session_expired_http`].
+pub fn log_openai_oauth_session_expired(
+    operation: &str,
+    provider: &str,
+    model: Option<&str>,
+    status: reqwest::StatusCode,
+) {
+    tracing::info!(
+        domain = "llm_provider",
+        operation = operation,
+        provider = provider,
+        model = model.unwrap_or(""),
+        status = status.as_u16(),
+        failure = "non_2xx",
+        kind = "provider_user_state",
+        reason = "openai_oauth_session_expired",
+        "[llm_provider] {operation} OpenAI OAuth session expired ({status}) — \
+         ChatGPT/Codex token lapsed without a usable refresh token; user must \
+         reconnect OpenAI, not reporting to Sentry"
+    );
+}
+
 /// Handle a backend session-expiry auth failure: publish a
 /// [`crate::core::event_bus::DomainEvent::SessionExpired`] so the credentials
 /// subscriber clears the session and flips the scheduler-gate signed-out
@@ -573,6 +775,11 @@ pub async fn api_error(provider: &str, response: reqwest::Response) -> anyhow::E
     // custom gateways mis-report it as 500 — TAURI-RUST-501 — so a status
     // gate would let those through to `should_report_provider_http_failure`).
     let is_context_window_exceeded = is_context_window_exceeded_message(&body);
+    // Monthly-quota exhaustion is likewise status-agnostic: the Kiro IDE proxy
+    // wraps its 402 inside a 500 envelope (TAURI-RUST-C9A), so match the body
+    // directly rather than gating on a 402 status (which the credits matcher
+    // below does). The user's third-party plan quota is spent — no local lever.
+    let is_quota_exhausted = is_provider_quota_exhausted(&body);
     // F4/F2: any managed-backend response carrying a stable `errorCode` is
     // backend-owned — it already paged or is expected user-state — so the FE
     // must not double-report. The one exception (malformed `BAD_REQUEST`) is
@@ -582,6 +789,19 @@ pub async fn api_error(provider: &str, response: reqwest::Response) -> anyhow::E
     // Missing/invalid BYO API key on a non-backend provider — user-config
     // state, not a product bug. Demote from Sentry (TAURI-RUST-DHM flood).
     let is_byo_auth_failure = is_byo_provider_auth_failure_http(provider, status, &body);
+    // OpenAI ChatGPT/Codex OAuth access token expired with no usable refresh
+    // token — user must reconnect OpenAI. Deterministic user-state, demote
+    // from Sentry (TAURI-RUST-8FQ flood).
+    let is_openai_oauth_session_expired =
+        is_openai_oauth_session_expired_http(provider, status, &body);
+    // Insufficient-credits 402: the user's own BYO provider account is out of
+    // balance — a flat billing fact, not a reservation-window error, so there is
+    // NO local max_tokens lever to apply. Demote from Sentry like the per-method
+    // compatible-provider arms; the complete classification for a genuinely-
+    // unpreventable BYO-balance condition (TAURI-RUST-4QF DeepSeek "Insufficient
+    // Balance"). This shared helper backs the two methods that delegate here
+    // (chat_via_responses fallback and the non-streaming completion path).
+    let is_insufficient_credits_402 = is_provider_insufficient_credits_402(status, &body);
 
     if is_auth_failure && is_backend {
         // Single source of truth for backend session-expiry handling (warn +
@@ -598,10 +818,16 @@ pub async fn api_error(provider: &str, response: reqwest::Response) -> anyhow::E
         log_provider_config_rejection("api_error", provider, None, status);
     } else if is_context_window_exceeded {
         log_context_window_exceeded("api_error", provider, None, status);
+    } else if is_quota_exhausted {
+        log_provider_quota_exhausted("api_error", provider, None, status);
     } else if is_backend_error_code_owned {
         log_backend_error_code_owned("api_error", provider, None, status, &body);
     } else if is_byo_auth_failure {
         log_byo_provider_auth_failure("api_error", provider, None, status);
+    } else if is_openai_oauth_session_expired {
+        log_openai_oauth_session_expired("api_error", provider, None, status);
+    } else if is_insufficient_credits_402 {
+        log_provider_insufficient_credits_402("api_error", provider, None, status);
     } else if should_report_provider_http_failure(status) {
         crate::core::observability::report_error(
             message.as_str(),
@@ -674,6 +900,147 @@ mod tests {
         assert!(!is_provider_insufficient_credits_402(
             StatusCode::PAYMENT_REQUIRED,
             "{\"error\":{\"message\":\"some unrelated condition\"}}"
+        ));
+    }
+
+    /// Verbatim TAURI-RUST-C9A provider body — the Kiro IDE proxy wraps its own
+    /// 402 monthly-quota refusal inside a 500 envelope. The matcher keys on this
+    /// prose, so coupling the test to the exact string makes a provider wording
+    /// drift fail CI rather than silently leak events back to Sentry.
+    const C9A_BODY: &str = "kiro API error (500 Internal Server Error): \
+        {\"error\":{\"message\":\"HTTP 402 from Kiro IDE: {\\\"message\\\":\\\"You have \
+        reached the limit.\\\",\\\"reason\\\":\\\"MONTHLY_REQUEST_COUNT\\\"}\",\
+        \"type\":\"server_error\"}}";
+
+    #[test]
+    fn quota_exhausted_matches_verbatim_c9a_body() {
+        // Status-agnostic: the verbatim 500-wrapped body must match even though
+        // the transport status is 500, not 402.
+        assert!(is_provider_quota_exhausted(C9A_BODY));
+        assert!(body_indicates_quota_exhausted(C9A_BODY));
+    }
+
+    #[test]
+    fn quota_exhausted_matches_common_phrasings() {
+        for body in [
+            "{\"reason\":\"MONTHLY_REQUEST_COUNT\"}",
+            "You have reached the limit on your monthly requests",
+            "monthly request quota reached",
+            "monthly limit reached",
+            "plan quota exceeded",
+            "usage limit exceeded for this period",
+        ] {
+            assert!(is_provider_quota_exhausted(body), "should match: {body:?}");
+        }
+    }
+
+    #[test]
+    fn quota_exhausted_ignores_unrelated_500_and_rate_limit() {
+        // A generic 500 outage and a 429 rate-limit are NOT plan-quota
+        // exhaustion and must stay reportable / retryable respectively — the
+        // quota guard must not swallow them.
+        for body in [
+            "kiro API error (500 Internal Server Error): {\"error\":\
+             {\"message\":\"upstream connection reset\",\"type\":\"server_error\"}}",
+            "rate_limit_exceeded: too many requests, retry after 12s",
+            "429 Too Many Requests",
+            "context length exceeded: reduce the number of tokens",
+        ] {
+            assert!(
+                !is_provider_quota_exhausted(body),
+                "should NOT match: {body:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn quota_and_credits_matchers_do_not_overlap_on_c9a() {
+        // The 402-gated credits matcher must keep ignoring the 500-wrapped
+        // quota body (it is status-anchored) — the quota matcher is the one
+        // that catches it. Proves the locked-in
+        // `insufficient_credits_402_ignores_non_402_status` invariant holds and
+        // the two classifiers cover distinct shapes.
+        assert!(!is_provider_insufficient_credits_402(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            C9A_BODY
+        ));
+        assert!(is_provider_quota_exhausted(C9A_BODY));
+    }
+
+    /// Verbatim TAURI-RUST-8FQ Responses-API body. The matcher keys on this
+    /// envelope, so coupling the test to the exact string makes a provider
+    /// wording drift fail CI rather than silently leak events to Sentry.
+    const OAUTH_EXPIRED_8FQ_BODY: &str = "{\"error\":{\"message\":\"Provided \
+        authentication token is expired. Please try signing in again.\",\
+        \"type\":null,\"code\":\"token_expired\",\"param\":null}}";
+
+    #[test]
+    fn openai_oauth_session_expired_matches_verbatim_8fq_body() {
+        assert!(is_openai_oauth_session_expired_http(
+            "openai",
+            StatusCode::UNAUTHORIZED,
+            OAUTH_EXPIRED_8FQ_BODY
+        ));
+    }
+
+    #[test]
+    fn openai_oauth_session_expired_matches_marker_variants() {
+        for body in [
+            "{\"error\":{\"code\":\"token_expired\"}}",
+            "Provided authentication token is expired.",
+            "Please try signing in again.",
+        ] {
+            assert!(
+                is_openai_oauth_session_expired_http("openai", StatusCode::UNAUTHORIZED, body),
+                "should match: {body:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn openai_oauth_session_expired_ignores_invalid_api_key_401() {
+        // A genuine bad-key rejection must NOT be swallowed here — it is
+        // routed by `is_byo_provider_auth_failure_http` instead and stays
+        // actionable. The two classifiers must not overlap.
+        let bad_key = "{\"error\":{\"code\":\"invalid_api_key\",\
+            \"message\":\"Incorrect API key provided.\"}}";
+        assert!(!is_openai_oauth_session_expired_http(
+            "openai",
+            StatusCode::UNAUTHORIZED,
+            bad_key
+        ));
+        assert!(is_byo_provider_auth_failure_http(
+            "openai",
+            StatusCode::UNAUTHORIZED,
+            bad_key
+        ));
+    }
+
+    #[test]
+    fn openai_oauth_session_expired_ignores_non_401_status() {
+        // Same prose on a non-401 status is not this user-state — keep it
+        // reportable so a genuine bug elsewhere isn't masked.
+        assert!(!is_openai_oauth_session_expired_http(
+            "openai",
+            StatusCode::INTERNAL_SERVER_ERROR,
+            OAUTH_EXPIRED_8FQ_BODY
+        ));
+        assert!(!is_openai_oauth_session_expired_http(
+            "openai",
+            StatusCode::BAD_REQUEST,
+            OAUTH_EXPIRED_8FQ_BODY
+        ));
+    }
+
+    #[test]
+    fn openai_oauth_session_expired_excludes_backend_provider() {
+        // The OpenHuman backend owns app-session expiry via
+        // `publish_backend_session_expired`; this provider-OAuth gate must not
+        // claim a backend 401.
+        assert!(!is_openai_oauth_session_expired_http(
+            openhuman_backend::PROVIDER_LABEL,
+            StatusCode::UNAUTHORIZED,
+            OAUTH_EXPIRED_8FQ_BODY
         ));
     }
 }
