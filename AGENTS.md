@@ -293,3 +293,5 @@ upstream  git@github.com:tinyhumansai/openhuman.git     (fetch-only)
 - **Unix-style modules**: small, single-responsibility, composed through clear boundaries.
 - **Tests before the next layer**: untested code is incomplete.
 - **Docs with code**: update AGENTS.md or architecture docs when rules or behavior change.
+
+# 所有的以学习为目的相关的文件放入GUIDE文件夹中
