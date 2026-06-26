@@ -10,6 +10,8 @@
 | [`30_LESSON_CURRICULUM.md`](30_LESSON_CURRICULUM.md) | 30 节课的大纲：七大阶段、每课知识点、阅读材料、动手任务 |
 | [`lesson-01-overview.md`](lesson-01-overview.md) | **第 1 课**：项目概览与产品定位 |
 | [`lesson-02-dev-setup.md`](lesson-02-dev-setup.md) | **第 2 课**：开发环境搭建 |
+| [`lesson-03-architecture.md`](lesson-03-architecture.md) | **第 3 课**：仓库结构与顶层架构 |
+| [`notes/lesson-02-env-vars.md`](notes/lesson-02-env-vars.md) | **笔记**：第 2 课环境变量详解 |
 
 ## 课程进度
 
@@ -17,7 +19,8 @@
 | --- | --- | --- |
 | 第 1 课 | ✅ 已完成 | 项目概览与产品定位 |
 | 第 2 课 | ✅ 已完成 | 开发环境搭建 |
-| 第 3-30 课 | ⏳ 待编写 | 参见 [30 节课程大纲](30_LESSON_CURRICULUM.md) |
+| 第 3 课 | ✅ 已完成 | 仓库结构与顶层架构 |
+| 第 4-30 课 | ⏳ 待编写 | 参见 [30 节课程大纲](30_LESSON_CURRICULUM.md) |
 
 ## 推荐学习顺序
 

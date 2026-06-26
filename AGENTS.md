@@ -300,3 +300,5 @@ upstream  git@github.com:tinyhumansai/openhuman.git     (fetch-only)
 - **Docs with code**: update AGENTS.md or architecture docs when rules or behavior change.
 
 # 所有的以学习为目的相关的文件放入GUIDE文件夹中
+# 学习者为Windows用户，惯用powershell
+# 学习者有Tauri，Rust，Vue，Python基础，做过一些玩具项目，但对如何构建工程化项目了解甚少，工程化思维欠缺

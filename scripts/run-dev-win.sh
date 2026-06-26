@@ -18,7 +18,7 @@ source "$REPO_ROOT/scripts/load-dotenv.sh"
 # are missing. Probe known Git-for-Windows install locations and prepend
 # `usr/bin` so the rest of the script works regardless of launcher.
 if ! command -v cygpath >/dev/null 2>&1; then
-  for git_root in "/c/Program Files/Git" "/c/Program Files (x86)/Git"; do
+  for git_root in "/d/Git" "/c/Program Files/Git" "/c/Program Files (x86)/Git"; do
     if [[ -x "$git_root/usr/bin/cygpath.exe" ]]; then
       export PATH="$git_root/usr/bin:$PATH"
       break
@@ -76,7 +76,7 @@ else
   echo "[run-dev-win] WARNING: cmd.exe not found at '$cmd_exe_for_path' — Windows PATH restoration skipped; node/cargo may be missing downstream" >&2
 fi
 
-export LIBCLANG_PATH="/c/Program Files/LLVM/bin"
+export LIBCLANG_PATH="/d/LLVM/bin"
 
 # Bootstrap the MSVC C++ build environment in this shell so cl.exe / link.exe /
 # Windows SDK headers are reachable without launching the "x64 Native Tools
